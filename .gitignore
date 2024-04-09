@@ -16,3 +16,6 @@ data/
 
 # Output files
 output/
+data/
+
+venv/

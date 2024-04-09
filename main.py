@@ -1,5 +1,5 @@
 import torch
-from torch.utils.tensorboard import SummaryWriter
+#from torch.utils.tensorboard import SummaryWriter
 import argparse
 import yaml
 import os
@@ -13,7 +13,7 @@ from utils import *
     
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default='./configs/miniroad_thumos_kinetics.yaml')
+    parser.add_argument('--config', type=str, default='configs/miniroad_assembly.yaml')
     parser.add_argument('--eval', type=str, default=None)
     parser.add_argument('--amp', action='store_true')
     parser.add_argument('--tensorboard', action='store_true')
@@ -27,10 +27,13 @@ if __name__ == '__main__':
     opt.update(vars(args))
     cfg = opt
 
+    # FORCE NO-FLOW
+    cfg['no_flow'] = True
+
     set_seed(20)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    identifier = f'{cfg["model"]}_{cfg["data_name"]}_{cfg["feature_pretrained"]}_flow{not cfg["no_flow"]}'
+    identifier = f'{cfg["model"]}_{cfg["data_name"]}'
     result_path = create_outdir(osp.join(cfg['output_path'], identifier))
     logger = get_logger(result_path)
     logger.info(cfg)
@@ -40,19 +43,20 @@ if __name__ == '__main__':
     evaluate = build_eval(cfg)
     if args.eval != None:
         model.load_state_dict(torch.load(args.eval))
-        mAP = evaluate(model, testloader, logger)
+        mAP = evaluate(model, testloader, logger) # NOTE: EVALUATION
         logger.info(f'{cfg["task"]} result: {mAP*100:.2f} m{cfg["metric"]}')
         exit()
         
     trainloader = build_data_loader(cfg, mode='train')
     criterion = build_criterion(cfg, device)
+
     train_one_epoch = build_trainer(cfg)
     optim = torch.optim.AdamW if cfg['optimizer'] == 'AdamW' else torch.optim.Adam
     optimizer = optim([{'params': model.parameters(), 'initial_lr': cfg['lr']}],
                         lr=cfg['lr'], weight_decay=cfg["weight_decay"])
 
     scheduler = build_lr_scheduler(cfg, optimizer, len(trainloader)) if args.lr_scheduler else None
-    writer = SummaryWriter(osp.join(result_path, 'runs')) if args.tensorboard else None
+    #writer = SummaryWriter(osp.join(result_path, 'runs')) if args.tensorboard else None
     scaler = torch.cuda.amp.GradScaler() if args.amp else None
     total_params = sum(p.numel() for p in model.parameters())
 
@@ -61,15 +65,15 @@ if __name__ == '__main__':
     logger.info(f'Total epoch:{cfg["num_epoch"]} | Total Params:{total_params/1e6:.1f} M | Optimizer: {cfg["optimizer"]}')
     logger.info(f'Output Path:{result_path}')
 
-    best_mAP, best_epoch = 0, 0
+    best_quality_score, best_epoch = 0, 0
     for epoch in range(1, cfg['num_epoch']+1):
-        epoch_loss = train_one_epoch(trainloader, model, criterion, optimizer, scaler, epoch, writer, scheduler=scheduler)
-        trainloader.dataset._init_features()
-        mAP = evaluate(model, testloader, logger)
-        if mAP > best_mAP:
-            best_mAP = mAP
+        epoch_loss = train_one_epoch(trainloader, model, criterion, optimizer, scaler, epoch, None, scheduler=scheduler)
+        quality_score = evaluate(model, testloader, logger)
+        if quality_score > best_quality_score:
+            best_quality_score = quality_score
             best_epoch = epoch
             torch.save(model.state_dict(), osp.join(result_path, 'ckpts', 'best.pth'))
-        logger.info(f'Epoch {epoch} mAP: {mAP*100:.2f} | Best mAP: {best_mAP*100:.2f} at epoch {best_epoch}, iter {epoch*cfg["batch_size"]*len(trainloader)} | train_loss: {epoch_loss/len(trainloader):.4f}, lr: {optimizer.param_groups[0]["lr"]:.7f}')
+
+        logger.info(f'Epoch {epoch} mAP: {quality_score*100:.2f} | Best mAP: {best_quality_score*100:.2f} at epoch {best_epoch}, iter {epoch*cfg["batch_size"]*len(trainloader)} | train_loss: {epoch_loss/len(trainloader):.4f}, lr: {optimizer.param_groups[0]["lr"]:.7f}')
         
-    os.rename(osp.join(result_path, 'ckpts', 'best.pth'), osp.join(result_path, 'ckpts', f'best_{best_mAP*100:.2f}.pth'))
+    os.rename(osp.join(result_path, 'ckpts', 'best.pth'), osp.join(result_path, 'ckpts', f'best_{best_quality_score*100:.2f}.pth'))

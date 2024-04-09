@@ -1,6 +1,37 @@
 from tqdm import tqdm
 import torch
 from trainer.train_builder import TRAINER
+import einops as ein
+
+@TRAINER.register("TAS")
+def train_one_epoch(trainloader, model, criterion, optimizer, scaler, epoch, writer=None, scheduler=None):
+    epoch_loss = 0
+    for it, (rgb_input, target) in enumerate(tqdm(trainloader, desc=f'Epoch:{epoch} Training', postfix=f'lr: {optimizer.param_groups[0]["lr"]:.7f}')):
+        rgb_input, target = rgb_input.cuda(), target.cuda()
+        model.train()
+        if scaler != None:
+            with torch.cuda.amp.autocast():    
+                out_dict = model(rgb_input, None) 
+                loss = criterion(out_dict, target)   
+            optimizer.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            out_dict = model(rgb_input, None) 
+            
+            logits = out_dict['logits']
+            logits = ein.rearrange(logits, "B T C -> B C T")
+            loss = criterion(logits, target)
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+
+        epoch_loss += loss.item()
+        if writer != None:
+            writer.add_scalar("Train Loss", loss.item(), it+epoch*len(trainloader))
+    return epoch_loss
 
 @TRAINER.register("OAD")
 def train_one_epoch(trainloader, model, criterion, optimizer, scaler, epoch, writer=None, scheduler=None):
