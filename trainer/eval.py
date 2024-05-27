@@ -7,52 +7,87 @@ from utils import *
 import json
 from trainer.eval_builder import EVAL
 from utils import thumos_postprocessing, perframe_average_precision
-from .criterion import calculate_metrics
+from .criterion import calculate_metrics, calculate_multi_metrics
+from criterions.loss import calculate_multi_loss
+from time import perf_counter_ns
 
 @EVAL.register("TAS")
 class TASEvaluate(nn.Module):
     def __init__(self, cfg):
         super(TASEvaluate, self).__init__()
+        self.cfg = cfg
 
-    def forward(self, model, dataloader, logger):
+    def forward(self, model, dataloader, logger, weights):
         device = "cuda:0"
         model.eval()   
         with torch.no_grad():
 
-            metrics = {
-                'F1@10': 0.0,
-                'F1@25': 0.0,
-                'F1@50': 0.0,
-                'edit':  0.0,
-                'mof':   0.0
+            epoch_elapsed = 0.0
+            epoch_fps = 0.0
+
+            epoch_loss_total = 0.0
+            epoch_loss = { 'verb': 0.0, 'noun': 0.0 }
+            epoch_metrics = { 
+                'verb': { 'mof': 0.0, 'edit': 0.0, 'F1@10': 0.0, 'F1@25': 0.0, 'F1@50': 0.0, }, 
+                'noun': { 'mof': 0.0, 'edit': 0.0, 'F1@10': 0.0, 'F1@25': 0.0, 'F1@50': 0.0, } 
             }
 
             start = time.time()
             batch_count = 0
-            for rgb_input, target in tqdm(dataloader, desc='Evaluation:', leave=False):
-                rgb_input, target = rgb_input.to(device), target.to(device)
-                batch_count += target.shape[0]
+            for rgb_input, poses, target in tqdm(dataloader, desc='Evaluation:', leave=False):
+                rgb_input, poses, target = rgb_input.to(device), poses.to(device), target.to(device)
+                frames_count = rgb_input.shape[1]
+                batch_count += 1
 
-                # Process batch                
-                out_dict = model(rgb_input, None)
-                logits = out_dict['logits']
-                probs = torch.softmax(logits, dim=-1)
-                predictions = torch.argmax(probs, dim=-1)
+                beg = perf_counter_ns()
+                outputs = model(rgb_input, poses)
+                end = perf_counter_ns()
 
-                batch_metrics = calculate_metrics(predictions, target, prefix='')
-                metrics = { key: val + batch_metrics[key] for key, val in metrics.items() }
+                # Framerate approximation
+                # NOTE: works only because test_batch_size is 1
+                elapsed_ms = (end - beg) * 1e-6
+                epoch_elapsed += (elapsed_ms / frames_count)
+                epoch_fps += frames_count / (elapsed_ms * 1e-3)
+
+                target_verb, target_noun = torch.split(target, split_size_or_sections=1, dim=-1)
+                target_verb = torch.squeeze(target_verb, dim=-1)
+                target_noun = torch.squeeze(target_noun, dim=-1)
+                target = [target_verb, target_noun]
+
+                categories = [('verb', 25), ('noun', 91)]
+                
+                # Criterions
+                batch_metrics = calculate_multi_metrics(outputs, target, categories)
+                for category_name, category_metrics in epoch_metrics.items():
+                    for metric_name, metric_value in category_metrics.items():
+                        epoch_metrics[category_name][metric_name] += batch_metrics[category_name][metric_name]
+
+                # Loss
+                losses, combined_loss = calculate_multi_loss(outputs, target, categories, self.cfg['alpha'], weights)
+                epoch_loss['verb'] += losses['verb']['loss_total']
+                epoch_loss['noun'] += losses['noun']['loss_total']
+                epoch_loss_total += combined_loss
 
             end = time.time()
             time_taken = end - start
 
-            metrics = { key: val / batch_count for key, val in metrics.items() }
-            metrics['edit'] /= 100 # NOTE: it's upper value is 100, normalize it
-
             logger.info(f'Processed frames in {time_taken:.1f} seconds, metrics={metrics}')
 
-        # Sum all criterions to get final quality score
-        final_score = sum(value for value in metrics.values())
-        return final_score
+        epoch_elapsed /= batch_count
+        epoch_fps /= batch_count
+
+        logger.info(f'elapsed(ms): {epoch_elapsed}, epoch_fps: {epoch_fps}')
+
+        # Mean over the entire epoch
+        for category_name, category_value in epoch_metrics.items():
+            for metric_name, _ in category_value.items():
+                epoch_metrics[category_name][metric_name] /= batch_count
+
+        epoch_loss_total /= batch_count
+        epoch_loss['verb'] /= batch_count
+        epoch_loss['noun'] /= batch_count
+
+        return epoch_loss_total, epoch_loss, epoch_metrics
 
 @EVAL.register("OAD")
 class Evaluate(nn.Module):

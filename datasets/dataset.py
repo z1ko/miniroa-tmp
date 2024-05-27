@@ -3,13 +3,15 @@ import torch.utils.data as data
 import numpy as np
 import einops as ein
 import json
-import tqdm
 import os.path as osp
 import pandas as pd
 import gc
 import os
 import lmdb
+import pickle
+
 from datasets.dataset_builder import DATA_LAYERS 
+from tqdm import tqdm
 
 FEATURE_SIZES = {
     'rgb_anet_resnet50': 2048,
@@ -97,111 +99,48 @@ class THUMOSDataset(data.Dataset):
         return len(self.inputs)
 
 @DATA_LAYERS.register("Assembly101")
-class AssemblyDataset(data.Dataset):
-    def __init__(self, cfg, mode='train'):
-        
-        self.mode = 'train' if mode == 'train' else 'val'
+class Assembly101Dataset(torch.utils.data.Dataset):
+    def __init__(self, config, mode):
 
-        self.views = ['C10095_rgb']
-        self.window_size = cfg['window_size']
+        # load classes weights
+        with open(config['categories_class_weight'], 'rb') as f:
+            self.weights = [torch.tensor(x, dtype=torch.float32).cuda() 
+                            for x in pickle.load(f)]
 
-        # Load all view databases
-        self.path_to_data = 'data/Assembly101'
-        self.envs = {view: lmdb.open(f'{self.path_to_data}/TSM/{view}', 
-                                     readonly=True, 
-                                     lock=False) for view in self.views}
-        
-        # Load actions and data
-        actions_path = os.path.join(self.path_to_data, 'coarse-annotations', 'actions.csv')
-        self.actions = pd.read_csv(actions_path)
-        self.data = self.make_database()
-
-    def make_database(self):
-        annotations_path = os.path.join(self.path_to_data, 'coarse-annotations')
-        data_path = os.path.join(self.path_to_data, f'{self.mode}.csv')
-        data_df = pd.read_csv(data_path)
-
-        video_data = []
-        max_len, min_len = -1, 1e6
-        for _, entry in tqdm.tqdm(data_df.iterrows(), total=len(data_df)):
-            sample = entry.to_dict()
+        self.items = []
+        split_path = os.path.join('data/Assembly101/processed', mode)
+        for item in tqdm(os.listdir(split_path)):
+            item_path = os.path.join(split_path, item)
             
-            # Skip views no required
-            if sample['view'] not in self.views:
-                continue
-
-            segm_filename = f"{sample['action_type']}_{sample['video_id']}.txt"
-            segm_path = os.path.join(annotations_path, "coarse_labels", segm_filename)
-            segm, start_frame, end_frame = self.load_segmentation(segm_path, self.actions)
-
-            max_len = max(max_len, end_frame - start_frame)
-            min_len = min(min_len, end_frame - start_frame)
-
-            # Create subsections of window_size for training
-            for beg in range(0, len(segm) - self.window_size, self.window_size):
-                end = beg + self.window_size
-
-                sample['segm'] = torch.tensor(segm[beg:end]).long()
-                sample['start_frame'] = start_frame + beg
-                sample['end_frame'] = start_frame + end
-                video_data.append(sample)
-
-            a = 0
-
-        print(f'elements={len(video_data)}, max_frames={max_len}, min_frames={min_len}')
-        return video_data
-
-    def load_segmentation(self, segm_path, actions):
-        labels = []
-        start_indices = []
-        end_indices = []
-
-        with open(segm_path, 'r') as f:
-            lines = list(map(lambda s: s.split("\n"), f.readlines()))
-            for line in lines:
-                start, end, lbl = line[0].split("\t")[:-1]
-                start_indices.append(int(start))
-                end_indices.append(int(end))
-                action_id = actions.loc[actions['action_cls'] == lbl, 'action_id']
-                segm_len = int(end) - int(start)
-                labels.append(np.full(segm_len, fill_value=action_id.item()))
-
-        segmentation = np.concatenate(labels)
-        num_frames = segmentation.shape[0]
-
-        # start and end frame idx @30fps
-        start_frame = min(start_indices)
-        end_frame = max(end_indices)
-        assert num_frames == (end_frame-start_frame), \
-            "Length of Segmentation doesn't match with clip length."
-
-        return segmentation, start_frame, end_frame
-
-    def load_features(self, data_dict):
-        elements = []
-        view = data_dict['view']
-        with self.envs[view].begin(write=False) as e:
-            for i in range(data_dict['start_frame'], data_dict['end_frame']):
-                key = os.path.join(data_dict['video_id'], f'{view}/{view}_{i:010d}.jpg')
-                frame_data = e.get(key.strip().encode('utf-8'))
-                if frame_data is None:
-                    print(f"[!] No data found for key={key}.")
-                    exit(2)
-
-                frame_data = np.frombuffer(frame_data, 'float32')
-                elements.append(frame_data)
-
-        features = np.array(elements) # [T, D]
-        return features
+            # No clips
+            if mode == 'validation':
+                self.items.append((item_path, None))
+            else:
+                frames = int(item.split('-')[0])
+                for beg in range(0, frames - config['window_size'], config['window_size']):
+                    self.items.append((item_path, (beg, beg + config['window_size'])))
 
     def __getitem__(self, idx):
-        data_dict = self.data[idx]
-        targets = data_dict['segm']
-        features = torch.tensor(self.load_features(data_dict))
-        return features, targets
+        path, clip = self.items[idx]
+        with open(path, 'rb') as f:
+            sample = pickle.load(f)
+
+        labels = torch.tensor(sample['fine-labels']).long()
+        embeddings = torch.tensor(sample['embeddings'], dtype=torch.float32)
+        poses = torch.tensor(sample['poses'],dtype=torch.float32)
+        poses = ein.rearrange(poses, 'T H J F -> T (H J) F')
+
+        if clip is not None:
+            beg, end = clip
+
+            labels = labels[beg:end, ...]
+            embeddings = embeddings[beg:end, ...]
+            poses = poses[beg:end, ...]
+
+        return embeddings, poses, labels[..., 1:]
 
     def __len__(self):
-        return len(self.data)
+        return len(self.items)
 
 @DATA_LAYERS.register("THUMOS_ANTICIPATION")
 @DATA_LAYERS.register("TVSERIES_ANTICIPATION")

@@ -7,16 +7,20 @@ optimizer: 'AdamW'
 device: 'cuda'
 output_path: './output'
 rgb_type: 'rgb_TSM'
-window_size: 3600 
+window_size: 960 # optimal on thumos acording to paper, we will use this as well  
 batch_size: 16 
 test_batch_size: 1 
-num_epoch: 30 
+num_epoch: 20 
 lr: 0.0001 
 weight_decay: 0.05
-num_workers: 1
+num_workers: 16
 dropout: 0.20
-num_classes: 202
+num_classes: 1381
 embedding_dim: 2048
-hidden_dim: 1024
+hidden_dim: 128 # was 1024
 num_layers: 1
 stride: 4
+alpha: 0.22
+
+categories_class_weight: 'data/Assembly101/fine-labels-weights.pkl'
+modality: 'embeddings' # alternatives: embeddings, poses

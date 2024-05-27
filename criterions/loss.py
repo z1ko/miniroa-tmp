@@ -4,42 +4,68 @@ import torch.nn.functional as F
 from criterions.loss_builder import CRITERIONS
 import einops as ein
 
+def calculate_multi_loss(logits, targets, categories, alpha, weights):
+    """ Calculate ce+mse multiloss between different target categories
+            logits:     an array of tensors, each of the shape [batch_size, seq_len, logits]
+            targets:    an array of tensors, each of the shape [batch_size, seq_len]
+            categories: [('verb', 25), ('noun', 90)]
+    """
+
+    result = { }
+    for category_name, _ in categories:
+        result[category_name] = {}
+
+    combined = 0.0
+    for i, (logit, target, category) in enumerate(zip(logits, targets, categories)):
+        #assert(target.shape[0] == 1)
+        category_name, num_classes = category
+        loss = CEplusMSE(num_classes, alpha=alpha, weight=weights[i])
+        category_result = loss(logit, target)
+        result[category_name] = category_result
+        
+        # Accumulated loss between all categories
+        combined += category_result['loss_total']
+
+    return result, combined
+
 @CRITERIONS.register('CEplusMSE')
-# NOTE: used for training
 class CEplusMSE(nn.Module):
     """
     Loss from MS-TCN paper. CrossEntropy + MSE
     https://arxiv.org/abs/1903.01945
     """
 
-    def __init__(self, cfg, alpha=0.17):
+    def __init__(self, num_classes, weight, alpha=0.17):
         super().__init__()
-        self.ce = nn.CrossEntropyLoss(ignore_index=-100)
+
+        self.ce = nn.CrossEntropyLoss(ignore_index=-100, weight=weight)
         self.mse = nn.MSELoss(reduction='none')
-        self.classes = cfg['num_classes']
+        self.classes = num_classes
         self.alpha = alpha
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor):
         """
-        :param logits: [stages, batch_size, classes, seq_len]
+        :param logits:  [batch_size, seq_len, logits]
         :param targets: [batch_size, seq_len]
         """
 
-        loss_dict = { 'loss': 0.0, 'loss_ce': 0.0, 'loss_mse': 0.0 }
+        logits = ein.rearrange(logits, 'batch_size seq_len logits -> batch_size logits seq_len')
+        loss = { }
 
         # Frame level classification
-        loss_dict['loss_ce'] += self.ce(
-            ein.rearrange(logits, "batch_size classes seq_len -> (batch_size seq_len) classes"),
+        loss['loss_ce'] = self.ce(
+            ein.rearrange(logits, "batch_size logits seq_len -> (batch_size seq_len) logits"),
             ein.rearrange(targets, "batch_size seq_len -> (batch_size seq_len)")
         )
 
         # Neighbour frames should have similar values
-        loss_dict['loss_mse'] += torch.mean(torch.clamp(self.mse(
+        loss['loss_mse'] = torch.mean(torch.clamp(self.mse(
             F.log_softmax(logits[:, :, 1:], dim=1),
             F.log_softmax(logits.detach()[:, :, :-1], dim=1)
-        ), min=0.0, max=16.0))
+        ), min=0.0, max=160.0))
 
-        return loss_dict['loss_ce'] + self.alpha * loss_dict['loss_mse']
+        loss['loss_total'] = loss['loss_ce'] + self.alpha * loss['loss_mse']
+        return loss
 
 @CRITERIONS.register('NONUNIFORM')
 class OadLoss(nn.Module):

@@ -11,6 +11,8 @@ from criterions import build_criterion
 from trainer import build_trainer, build_eval
 from utils import *
     
+import torch.utils.benchmark as benchmark
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, default='configs/miniroad_assembly.yaml')
@@ -38,8 +40,24 @@ if __name__ == '__main__':
     logger = get_logger(result_path)
     logger.info(cfg)
 
-    testloader = build_data_loader(cfg, mode='test')
+    testloader = build_data_loader(cfg, mode='validation')
+
+    # model dimension
+
+    torch.cuda.reset_peak_memory_stats(device=None)
+    memory = torch.cuda.max_memory_allocated()
     model = build_model(cfg, device)
+    memory = torch.cuda.max_memory_allocated()
+    print('memory_usage: ', memory / 1e6, '(MB)')
+
+    #elapsed, fps = model.benchmark_framerate()
+    #print(f'elapsed ms for frame: {elapsed}, fps: {fps}')
+
+    # load classes weights
+    with open(cfg['categories_class_weight'], 'rb') as f:
+        weights = [torch.tensor(x, dtype=torch.float32).cuda() 
+                    for x in pickle.load(f)]
+
     evaluate = build_eval(cfg)
     if args.eval != None:
         model.load_state_dict(torch.load(args.eval))
@@ -48,7 +66,7 @@ if __name__ == '__main__':
         exit()
         
     trainloader = build_data_loader(cfg, mode='train')
-    criterion = build_criterion(cfg, device)
+    #criterion = build_criterion(cfg, device)
 
     train_one_epoch = build_trainer(cfg)
     optim = torch.optim.AdamW if cfg['optimizer'] == 'AdamW' else torch.optim.Adam
@@ -65,15 +83,29 @@ if __name__ == '__main__':
     logger.info(f'Total epoch:{cfg["num_epoch"]} | Total Params:{total_params/1e6:.1f} M | Optimizer: {cfg["optimizer"]}')
     logger.info(f'Output Path:{result_path}')
 
-    best_quality_score, best_epoch = 0, 0
-    for epoch in range(1, cfg['num_epoch']+1):
-        epoch_loss = train_one_epoch(trainloader, model, criterion, optimizer, scaler, epoch, None, scheduler=scheduler)
-        quality_score = evaluate(model, testloader, logger)
-        if quality_score > best_quality_score:
-            best_quality_score = quality_score
-            best_epoch = epoch
-            torch.save(model.state_dict(), osp.join(result_path, 'ckpts', 'best.pth'))
+    # TEST PERFORMANCE
+    if False:
+        blob = torch.zeros((1, 2, 2048)).to('cuda')
+        with torch.no_grad():
+            t0 = benchmark.Timer(
+                stmt='model.forward(blob, None)',
+                globals={
+                    'model': model,
+                    'blob': blob
+                }
+            )
+        print(t0.timeit(100))
 
-        logger.info(f'Epoch {epoch} mAP: {quality_score*100:.2f} | Best mAP: {best_quality_score*100:.2f} at epoch {best_epoch}, iter {epoch*cfg["batch_size"]*len(trainloader)} | train_loss: {epoch_loss/len(trainloader):.4f}, lr: {optimizer.param_groups[0]["lr"]:.7f}')
+    best_quality_score, best_epoch = 1e6, 0
+    for epoch in range(1, cfg['num_epoch']+1):
+
+        loss_dict, epoch_loss = train_one_epoch(trainloader, model, None, optimizer, scaler, epoch, 
+                                                cfg['alpha'], weights, None, scheduler=scheduler)
         
-    os.rename(osp.join(result_path, 'ckpts', 'best.pth'), osp.join(result_path, 'ckpts', f'best_{best_quality_score*100:.2f}.pth'))
+        logger.info(f'train_loss_total: {epoch_loss}, train_loss: {loss_dict}')
+        if epoch_loss < best_quality_score:
+            best_quality_score = epoch_loss
+            logger.info(f'[LAST BEST!] train_loss_total: {epoch_loss}, train_loss: {loss_dict}')
+
+        epoch_loss_total, epoch_loss, epoch_metrics = evaluate(model, testloader, logger, weights)
+        logger.info(f'val_loss_total: {epoch_loss_total}, val_loss: {epoch_loss}, val_metrics: {epoch_metrics}')

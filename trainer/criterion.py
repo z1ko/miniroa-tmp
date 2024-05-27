@@ -5,15 +5,48 @@ import torch.nn.functional as F
 import einops as ein
 import numpy as np
 
-def calculate_metrics(predictions, targets, prefix='val/'):
+def log_multi_result(result, logger, mode):
+    """ Log a multi result from losses or metrics
+    """
+    for key, value in result:
+        prefix = f'{key}/{mode}'
+        for metric_name, metric_value in value:
+            logger.log(f'{prefix}/{metric_name}', metric_value, on_epoch=True, on_step=False, prog_bar=False)
+
+def calculate_multi_metrics(logits, targets, categories):
+    """ Calculate ce+mse multiloss between different target categories
+    """
+
+    result = {}
+    for category_name, _ in categories:
+        result[category_name] = {}
+
+    for logit, target, category in zip(logits, targets, categories):
+        category_name, _ = category
+
+        category_result = calculate_metrics(logit, target, prefix=None)
+        result[category_name] = category_result
+        
+    return result
+
+def calculate_metrics(logits, targets, prefix=None):
+    """ logits:  [batch_size, seq_len, logits]
+        targets: [batch_size, seq_len]
+    """
 
     mof = MeanOverFramesAccuracy()
     f1 = F1Score()
     edit = EditDistance(True)
 
+    probabilities = torch.softmax(logits, dim=-1)
+    predictions = torch.argmax(probabilities, dim=-1)
+
     result = { 'mof': mof(predictions, targets), 'edit': edit(predictions, targets) }
     result.update(f1(predictions, targets))
-    result = { f'{prefix}{key}': val for key,val in result.items() }
+
+    if prefix is not None:
+        result = { f'{prefix}/{key}': val for key,val in result.items() }
+    
     return result
 
 def _get_labels_start_end_time(frame_wise_labels, ignored_classes=[-100]):
@@ -303,7 +336,7 @@ class EditDistance:
             ))
 
         # Mean in the batch
-        return sum(batch_scores) / len(batch_scores)
+        return sum(batch_scores) / len(batch_scores) * 0.01
     
     @staticmethod
     def edit_score(predictions, targets, norm=True, ignore_classes=[-100]):
